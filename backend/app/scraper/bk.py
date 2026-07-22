@@ -33,50 +33,60 @@ PAGE_SIZE = 50
 MAX_PAGES = 200
 REQUEST_GAP_S = 0.7
 
-# Diagnoza produkcyjna (2026-07): /api/announcements wymaga logowania (401),
-# /api/announcements/search istnieje, ale zwraca 500 przy prostych parametrach GET
-# — prawdopodobnie oczekuje innych nazw parametrów albo metody POST z JSON-em.
-# Sondujemy warianty; pierwszy działający jest używany do paginacji.
+# Diagnoza produkcyjna (2026-07):
+#  - /api/announcements: 401 (wymaga logowania) — pomijamy,
+#  - /api/announcements/search i /api/announcements/list: istnieją, GET,
+#    ale zwracają 500 na proste parametry (POST -> 405, więc na pewno GET).
+# Hipotezy: wymagane nagłówki przeglądarkowe (Referer/Origin/UA) albo inne
+# nazwy parametrów. Sondujemy warianty; pierwszy działający jest używany.
 SEARCH = BASE + "/api/announcements/search"
+LIST = BASE + "/api/announcements/list"
+
+BROWSER_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+    "Referer": BASE + "/",
+    "Origin": BASE,
+    "X-Requested-With": "XMLHttpRequest",
+}
+
 
 def _attempts():
-    """Lista prób: (nazwa, metoda, funkcja page,n -> (params, json))."""
+    """(nazwa, url, funkcja page,n -> params, nagłówki|None)."""
+    B = BROWSER_HEADERS
     return [
-        ("search GET searchText", "GET",
-         lambda p, n: ({"searchText": "", "page": p, "perPage": n}, None)),
-        ("search GET q", "GET",
-         lambda p, n: ({"q": "", "page": p, "perPage": n}, None)),
-        ("search GET goły", "GET", lambda p, n: ({"page": p}, None)),
-        ("search POST page-perPage", "POST",
-         lambda p, n: (None, {"page": p, "perPage": n})),
-        ("search POST searchText", "POST",
-         lambda p, n: (None, {"searchText": "", "page": p, "perPage": n})),
-        ("search POST pagination", "POST",
-         lambda p, n: (None, {"pagination": {"page": p, "perPage": n}})),
-        ("search POST filters", "POST",
-         lambda p, n: (None, {"filters": {}, "pagination": {"page": p, "perPage": n}})),
-        ("search POST pusty", "POST", lambda p, n: (None, {})),
-        ("announcements/list GET", "GET",
-         lambda p, n: ({"page": p, "perPage": n}, None),
-         BASE + "/api/announcements/list"),
-        ("search/announcements GET", "GET",
-         lambda p, n: ({"page": p, "perPage": n}, None),
-         BASE + "/api/search/announcements"),
+        ("search przeglądarkowy goły", SEARCH, lambda p, n: {"page": p}, B),
+        ("search przeglądarkowy page-perPage", SEARCH,
+         lambda p, n: {"page": p, "perPage": n}, B),
+        ("list przeglądarkowy page-perPage", LIST,
+         lambda p, n: {"page": p, "perPage": n}, B),
+        ("search phrase", SEARCH,
+         lambda p, n: {"phrase": "", "page": p, "perPage": n}, B),
+        ("search searchPhrase", SEARCH,
+         lambda p, n: {"searchPhrase": "", "page": p, "perPage": n}, B),
+        ("search status", SEARCH,
+         lambda p, n: {"status": "PUBLISHED", "page": p, "perPage": n}, B),
+        ("search sort", SEARCH,
+         lambda p, n: {"sort": "-publicationDate", "page": p, "perPage": n}, B),
+        ("search orderBy", SEARCH,
+         lambda p, n: {"orderBy": "publicationDate", "orderType": "desc",
+                       "page": p, "perPage": n}, B),
+        ("search pageNumber-itemsPerPage", SEARCH,
+         lambda p, n: {"pageNumber": p, "itemsPerPage": n}, B),
+        ("search offset-limit", SEARCH,
+         lambda p, n: {"offset": (p - 1) * n, "limit": n}, B),
+        ("search keyword", SEARCH,
+         lambda p, n: {"keyword": "", "page": p, "perPage": n}, B),
+        ("list goły", LIST, lambda p, n: {"page": p}, B),
     ]
 
 
 def _request(client, attempt, page, per_page):
-    name, method, make = attempt[0], attempt[1], attempt[2]
-    url = attempt[3] if len(attempt) > 3 else SEARCH
-    params, body = make(page, per_page)
-    if method == "POST":
-        return client.post(url, json=body, params=params,
-                           headers=_headers(), timeout=40)
-    return client.get(url, params=params, headers=_headers(), timeout=40)
-
-
-def _headers() -> dict:
-    return {"Accept": "application/json", "User-Agent": settings.user_agent}
+    name, url, make, headers = attempt
+    return client.get(url, params=make(page, per_page),
+                      headers=headers or _headers(), timeout=40)
 
 
 def _extract_items(payload) -> list[dict]:
