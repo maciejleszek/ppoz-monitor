@@ -40,11 +40,14 @@ services:
     name: ppoz-monitor
     runtime: static
     rootDir: frontend
-    buildCommand: npm install && npm run build
+    # property:host zwraca hostname w sieci PRYWATNEJ Rendera (np. ppoz-monitor-api-xxxx),
+    # nieosiągalny z przeglądarki. Publiczny adres = ten hostname + .onrender.com,
+    # więc pełny URL składamy tutaj, w komendzie budowania:
+    buildCommand: npm install && VITE_API_URL="https://${API_HOST}.onrender.com" npm run build
     staticPublishPath: dist
     envVars:
-      - key: VITE_API_URL
+      - key: API_HOST
         fromService:
           name: ppoz-monitor-api
           type: web
-          property: host # sam hostname; frontend dokleja https://
+          property: host
