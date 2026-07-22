@@ -47,11 +47,11 @@ export default function App() {
     }
   }, [data.total, regions.length]);
 
-  // Gdy baza jest pusta, a pobieranie trwa w tle — odpytuj serwer co 15 s,
-  // żeby strona sama pokazała wyniki po zakończeniu bootstrapu.
+  // Dopóki pobieranie trwa w tle — odpytuj serwer co 15 s. Zapis jest
+  // przyrostowy, więc liczniki i lista rosną na żywo, bez ręcznego odświeżania.
   useEffect(() => {
     if (loading) return;
-    if (data.total === 0 && stats?.last_run?.status === "running") {
+    if (stats?.last_run?.status === "running") {
       const t = setTimeout(() => setTick((x) => x + 1), 15000);
       return () => clearTimeout(t);
     }

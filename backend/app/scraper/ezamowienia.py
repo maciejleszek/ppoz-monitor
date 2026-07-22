@@ -143,7 +143,27 @@ def _extract_items(payload) -> list[dict]:
     return []
 
 
-def _fetch_notices(client: httpx.Client, notice_type: str, days_back: int) -> list[dict]:
+def _get_page(client: httpx.Client, headers: dict, params: dict):
+    """Jedna strona wyników z krótką ponowną próbą przy błędzie przejściowym."""
+    last = None
+    for attempt in (1, 2):
+        try:
+            resp = client.get(API_URL, params=params, headers=headers, timeout=40)
+            if resp.status_code in (400, 403, 422):
+                raise _BadParams(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            resp.raise_for_status()
+            return resp
+        except httpx.HTTPError as err:
+            last = err
+            if attempt == 1:
+                time.sleep(2)
+    raise last
+
+
+def _iter_batches(client: httpx.Client, notice_type: str, days_back: int):
+    """Strumieniuje kolejne strony wyników (generator). Wybiera pierwszy
+    działający wariant zapytania i trzyma się go do końca paginacji.
+    Dzięki temu scrape() może zapisywać dane przyrostowo, strona po stronie."""
     cutoff = datetime.now() - timedelta(days=days_back + 1)
     attempts: list[str] = []
 
@@ -153,46 +173,60 @@ def _fetch_notices(client: httpx.Client, notice_type: str, days_back: int) -> li
             has_dates = "PublicationDateFrom" in extra
             # bez sortowania i bez dat nie da się bezpiecznie paginować w głąb
             max_pages = MAX_PAGES if (has_sort or has_dates) else 40
-            items: list[dict] = []
-            try:
-                page = 1
-                while page <= max_pages:
-                    params = {
-                        "NoticeType": notice_type,
-                        "PageNumber": page,
-                        "PageSize": PAGE_SIZE,
-                        **extra,
-                    }
-                    resp = client.get(API_URL, params=params, headers=headers, timeout=40)
-                    if resp.status_code in (400, 403, 422):
-                        raise _BadParams(f"HTTP {resp.status_code}: {resp.text[:200]}")
-                    resp.raise_for_status()
+            page, total, yielded_any = 1, 0, False
 
-                    batch = _extract_items(resp.json())
-                    if not batch:
-                        break
-                    items.extend(batch)
+            while page <= max_pages:
+                params = {
+                    "NoticeType": notice_type,
+                    "PageNumber": page,
+                    "PageSize": PAGE_SIZE,
+                    **extra,
+                }
+                try:
+                    resp = _get_page(client, headers, params)
+                except (_BadParams, httpx.HTTPError) as err:
+                    if yielded_any:
+                        # wariant działał, błąd wystąpił w trakcie —
+                        # oddajemy to, co już pobrano (jest już w bazie)
+                        log.warning(
+                            "BZP %s: przerwano na stronie %d (%s); "
+                            "dotychczasowe dane zostają.",
+                            notice_type, page, err,
+                        )
+                        return
+                    attempts.append(f"{profile_name}/{recipe_name}: {err}")
+                    log.warning("BZP %s — wariant nieudany: %s",
+                                notice_type, attempts[-1][:300])
+                    break  # następny wariant zapytania
 
-                    oldest = _parse_dt(batch[-1].get("publicationDate"))
-                    if len(batch) < PAGE_SIZE or (has_sort and oldest and oldest < cutoff):
-                        break
-                    page += 1
-                    time.sleep(REQUEST_GAP_S)
+                batch = _extract_items(resp.json())
+                if not batch:
+                    if yielded_any:
+                        return  # naturalny koniec wyników
+                    attempts.append(
+                        f"{profile_name}/{recipe_name}: HTTP 200, ale 0 wyników"
+                    )
+                    break
 
-                if not items:
-                    # 200 OK, ale zero wyników = najpewniej zignorowane parametry
-                    raise _BadParams("HTTP 200, ale 0 wyników")
+                if not yielded_any:
+                    log.info("BZP %s: działa wariant nagłówki=%s, parametry=%s",
+                             notice_type, profile_name, recipe_name)
+                yielded_any = True
+                total += len(batch)
+                if page % 20 == 0:
+                    log.info("BZP %s: strona %d, rekordów dotąd: %d",
+                             notice_type, page, total)
+                yield batch
 
-                log.info(
-                    "BZP %s: pobrano %d ogłoszeń (nagłówki=%s, parametry=%s)",
-                    notice_type, len(items), profile_name, recipe_name,
-                )
-                return items
-            except (_BadParams, httpx.HTTPError) as err:
-                note = f"{profile_name}/{recipe_name}: {err}"
-                attempts.append(note)
-                log.warning("BZP %s — próba nieudana: %s", notice_type, note[:300])
-                continue
+                oldest = _parse_dt(batch[-1].get("publicationDate"))
+                if len(batch) < PAGE_SIZE or (has_sort and oldest and oldest < cutoff):
+                    return
+                page += 1
+                time.sleep(REQUEST_GAP_S)
+
+            if yielded_any:
+                log.info("BZP %s: osiągnięto limit %d stron.", notice_type, max_pages)
+                return
 
     raise RuntimeError(
         "API BZP odrzuciło wszystkie warianty zapytania. Próby: "
@@ -292,22 +326,26 @@ def _upsert(db, raw: dict, cutoff: datetime) -> str | None:
 
 
 def scrape(db, days_back: int) -> tuple[int, int, int]:
-    """Pobiera ogłoszenia z BZP z ostatnich `days_back` dni.
-    Zwraca (dopasowane_do_branży, dodane, zaktualizowane)."""
+    """Pobiera ogłoszenia z BZP z ostatnich `days_back` dni, zapisując wyniki
+    PRZYROSTOWO — commit po każdej stronie. Przerwany przebieg (deploy,
+    restart) zostawia więc wszystko, co zdążył pobrać, a statystyki na
+    stronie rosną na żywo. Zwraca (dopasowane, dodane, zaktualizowane)."""
     cutoff = datetime.now() - timedelta(days=days_back + 1)
     found = added = updated = 0
 
     with httpx.Client(follow_redirects=True) as client:
         for notice_type in NOTICE_TYPES:
-            for raw in _fetch_notices(client, notice_type, days_back):
-                result = _upsert(db, raw, cutoff)
-                if result is None:
-                    continue
-                found += 1
-                if result == "added":
-                    added += 1
-                elif result == "updated":
-                    updated += 1
+            for batch in _iter_batches(client, notice_type, days_back):
+                for raw in batch:
+                    result = _upsert(db, raw, cutoff)
+                    if result is None:
+                        continue
+                    found += 1
+                    if result == "added":
+                        added += 1
+                    elif result == "updated":
+                        updated += 1
+                db.commit()  # zapis przyrostowy — strona po stronie
 
     db.commit()
     return found, added, updated
