@@ -33,18 +33,46 @@ PAGE_SIZE = 50
 MAX_PAGES = 200
 REQUEST_GAP_S = 0.7
 
-# Kandydaci: (nazwa, endpoint, funkcja page->params)
-ENDPOINTS = [
-    ("announcements", BASE + "/api/announcements"),
-    ("announcements-search", BASE + "/api/announcements/search"),
-    ("ogloszenia", BASE + "/api/ogloszenia"),
-]
-PARAM_STYLES = [
-    ("page-perPage", lambda p, n: {"page": p, "perPage": n}),
-    ("page-pageSize", lambda p, n: {"page": p, "pageSize": n}),
-    ("page-limit", lambda p, n: {"page": p, "limit": n}),
-    ("PageNumber-PageSize", lambda p, n: {"PageNumber": p, "PageSize": n}),
-]
+# Diagnoza produkcyjna (2026-07): /api/announcements wymaga logowania (401),
+# /api/announcements/search istnieje, ale zwraca 500 przy prostych parametrach GET
+# — prawdopodobnie oczekuje innych nazw parametrów albo metody POST z JSON-em.
+# Sondujemy warianty; pierwszy działający jest używany do paginacji.
+SEARCH = BASE + "/api/announcements/search"
+
+def _attempts():
+    """Lista prób: (nazwa, metoda, funkcja page,n -> (params, json))."""
+    return [
+        ("search GET searchText", "GET",
+         lambda p, n: ({"searchText": "", "page": p, "perPage": n}, None)),
+        ("search GET q", "GET",
+         lambda p, n: ({"q": "", "page": p, "perPage": n}, None)),
+        ("search GET goły", "GET", lambda p, n: ({"page": p}, None)),
+        ("search POST page-perPage", "POST",
+         lambda p, n: (None, {"page": p, "perPage": n})),
+        ("search POST searchText", "POST",
+         lambda p, n: (None, {"searchText": "", "page": p, "perPage": n})),
+        ("search POST pagination", "POST",
+         lambda p, n: (None, {"pagination": {"page": p, "perPage": n}})),
+        ("search POST filters", "POST",
+         lambda p, n: (None, {"filters": {}, "pagination": {"page": p, "perPage": n}})),
+        ("search POST pusty", "POST", lambda p, n: (None, {})),
+        ("announcements/list GET", "GET",
+         lambda p, n: ({"page": p, "perPage": n}, None),
+         BASE + "/api/announcements/list"),
+        ("search/announcements GET", "GET",
+         lambda p, n: ({"page": p, "perPage": n}, None),
+         BASE + "/api/search/announcements"),
+    ]
+
+
+def _request(client, attempt, page, per_page):
+    name, method, make = attempt[0], attempt[1], attempt[2]
+    url = attempt[3] if len(attempt) > 3 else SEARCH
+    params, body = make(page, per_page)
+    if method == "POST":
+        return client.post(url, json=body, params=params,
+                           headers=_headers(), timeout=40)
+    return client.get(url, params=params, headers=_headers(), timeout=40)
 
 
 def _headers() -> dict:
@@ -159,51 +187,49 @@ def _upsert(db, raw: dict, cutoff: datetime) -> str | None:
 
 def _iter_batches(client: httpx.Client, days_back: int):
     cutoff = datetime.now() - timedelta(days=days_back + 1)
-    attempts: list[str] = []
+    attempts_log: list[str] = []
 
-    for ep_name, endpoint in ENDPOINTS:
-        for style_name, make in PARAM_STYLES:
-            page, yielded_any = 1, False
-            while page <= MAX_PAGES:
-                try:
-                    resp = client.get(endpoint, params=make(page, PAGE_SIZE),
-                                      headers=_headers(), timeout=40)
-                    if resp.status_code != 200:
-                        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:150]}")
-                    batch = _extract_items(resp.json())
-                except Exception as err:
-                    if yielded_any:
-                        log.warning("BK: przerwano na stronie %d (%s); "
-                                    "dotychczasowe dane zostają.", page, err)
-                        return
-                    attempts.append(f"{ep_name}/{style_name}: {err}")
-                    break
-
-                if not batch:
-                    if yielded_any:
-                        return
-                    attempts.append(f"{ep_name}/{style_name}: HTTP 200, ale 0 pozycji")
-                    break
-
-                if not yielded_any:
-                    log.info("BK: działa wariant %s/%s", ep_name, style_name)
-                yielded_any = True
-                yield batch
-
-                # koniec, gdy najstarszy rekord strony wypada przed zakresem
-                oldest = _parse_dt(_pick(batch[-1], "publicationDate", "publishedAt",
-                                         "dataPublikacji", "createdAt"))
-                if len(batch) < PAGE_SIZE or (oldest and oldest < cutoff):
+    for attempt in _attempts():
+        name = attempt[0]
+        page, yielded_any = 1, False
+        while page <= MAX_PAGES:
+            try:
+                resp = _request(client, attempt, page, PAGE_SIZE)
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:150]}")
+                batch = _extract_items(resp.json())
+            except Exception as err:
+                if yielded_any:
+                    log.warning("BK: przerwano na stronie %d (%s); "
+                                "dotychczasowe dane zostają.", page, err)
                     return
-                page += 1
-                time.sleep(REQUEST_GAP_S)
+                attempts_log.append(f"{name}: {err}")
+                break
 
-            if yielded_any:
+            if not batch:
+                if yielded_any:
+                    return
+                attempts_log.append(f"{name}: HTTP 200, ale 0 pozycji")
+                break
+
+            if not yielded_any:
+                log.info("BK: działa wariant %s", name)
+            yielded_any = True
+            yield batch
+
+            oldest = _parse_dt(_pick(batch[-1], "publicationDate", "publishedAt",
+                                     "dataPublikacji", "createdAt"))
+            if len(batch) < PAGE_SIZE or (oldest and oldest < cutoff):
                 return
+            page += 1
+            time.sleep(REQUEST_GAP_S)
+
+        if yielded_any:
+            return
 
     raise RuntimeError(
         "BK: żaden wariant endpointu nie zadziałał (sprawdź /api/debug/bk). Próby: "
-        + " | ".join(a[:140] for a in attempts)
+        + " | ".join(a[:140] for a in attempts_log)
     )
 
 
@@ -230,32 +256,30 @@ def scrape(db, days_back: int) -> tuple[int, int, int]:
 
 
 def probe() -> dict:
-    """Diagnostyka dla /api/debug/bk — które warianty endpointu odpowiadają."""
+    """Diagnostyka dla /api/debug/bk — które warianty wywołania odpowiadają."""
     results: list[dict] = []
     with httpx.Client(follow_redirects=True) as client:
-        for ep_name, endpoint in ENDPOINTS:
-            for style_name, make in PARAM_STYLES:
-                entry: dict = {"endpoint": ep_name, "parametry": style_name}
-                try:
-                    resp = client.get(endpoint, params=make(1, 2),
-                                      headers=_headers(), timeout=25)
-                    entry["status_http"] = resp.status_code
-                    if resp.status_code == 200:
-                        items = _extract_items(resp.json())
-                        entry["liczba_pozycji"] = len(items)
-                        if items:
-                            entry["pola_rekordu"] = sorted(items[0].keys())
-                            entry["przykladowy_rekord"] = {
-                                k: str(v)[:120] for k, v in items[0].items()
-                            }
-                            results.append(entry)
-                            return {"wynik": "ok", "dzialajacy_wariant": entry,
-                                    "wszystkie_proby": results}
-                        entry["uwaga"] = "200, ale nie znaleziono listy pozycji"
-                    else:
-                        entry["odpowiedz"] = resp.text[:200]
-                except Exception as err:
-                    entry["blad"] = f"{type(err).__name__}: {err}"[:200]
-                results.append(entry)
-                time.sleep(0.4)
+        for attempt in _attempts():
+            entry: dict = {"wariant": attempt[0]}
+            try:
+                resp = _request(client, attempt, 1, 2)
+                entry["status_http"] = resp.status_code
+                if resp.status_code == 200:
+                    items = _extract_items(resp.json())
+                    entry["liczba_pozycji"] = len(items)
+                    if items:
+                        entry["pola_rekordu"] = sorted(items[0].keys())
+                        entry["przykladowy_rekord"] = {
+                            k: str(v)[:120] for k, v in items[0].items()
+                        }
+                        results.append(entry)
+                        return {"wynik": "ok", "dzialajacy_wariant": entry,
+                                "wszystkie_proby": results}
+                    entry["uwaga"] = "200, ale nie znaleziono listy pozycji"
+                else:
+                    entry["odpowiedz"] = resp.text[:200]
+            except Exception as err:
+                entry["blad"] = f"{type(err).__name__}: {err}"[:200]
+            results.append(entry)
+            time.sleep(0.4)
     return {"wynik": "zaden wariant nie zadzialal", "wszystkie_proby": results}
