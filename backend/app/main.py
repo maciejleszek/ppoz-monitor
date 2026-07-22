@@ -26,6 +26,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)
 log = logging.getLogger("app")
 
 
+def _cleanup_stale_runs() -> None:
+    """Po restarcie procesu żaden przebieg nie może już 'trwać' — wątki nie
+    przeżywają restartu. Wiszące wpisy 'running' oznaczamy jako przerwane,
+    inaczej nagłówek strony w nieskończoność pokazuje 'pobieranie w toku'."""
+    try:
+        db = SessionLocal()
+        stale = db.query(ScrapeRun).filter(ScrapeRun.status == "running").all()
+        for run in stale:
+            run.status = "error"
+            run.message = "przerwane restartem serwera (np. deploy lub uśpienie)"
+            run.finished_at = datetime.now()
+        if stale:
+            log.warning("Oznaczono %d zawieszonych przebiegów jako przerwane.", len(stale))
+        db.commit()
+        db.close()
+    except Exception:
+        log.exception("Nie udało się wyczyścić zawieszonych przebiegów.")
+
+
 def _bootstrap_if_empty() -> None:
     """Przy pierwszym uruchomieniu (pusta baza) pobierz dane w tle."""
     if not settings.auto_bootstrap:
@@ -50,6 +69,7 @@ def _bootstrap_if_empty() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    _cleanup_stale_runs()
     _bootstrap_if_empty()
     if settings.enable_scheduler:
         scheduler.start()
@@ -87,6 +107,15 @@ def root():
 @app.get("/api/health")
 def health():
     return {"status": "ok", "time": datetime.now().isoformat()}
+
+
+@app.get("/api/debug/bzp")
+def debug_bzp():
+    """Diagnostyka połączenia z API BZP wykonana z TEGO serwera.
+    Pokazuje, który wariant zapytania działa, kody HTTP nieudanych prób
+    i rzeczywiste nazwy pól w rekordzie (m.in. do weryfikacji województwa)."""
+    from .scraper import ezamowienia
+    return ezamowienia.probe()
 
 
 # ── Ogłoszenia ──────────────────────────────────────────────────────────────

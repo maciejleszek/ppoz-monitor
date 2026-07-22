@@ -18,8 +18,10 @@ export default function App() {
   const [stats, setStats] = useState(null);
   const [regions, setRegions] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [slowHint, setSlowHint] = useState(false);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState(null);
+  const [tick, setTick] = useState(0);
 
   // Debounce pola wyszukiwania.
   useEffect(() => {
@@ -36,22 +38,54 @@ export default function App() {
     getRegions().then(setRegions).catch(() => {});
   }, []);
 
+  // Samonaprawa: jeśli są już ogłoszenia, a lista województw wciąż pusta
+  // (np. pierwsze pobranie trafiło na uśpiony serwer albo pustą bazę),
+  // spróbuj pobrać ją ponownie po udanym załadowaniu wyników.
+  useEffect(() => {
+    if (data.total > 0 && regions.length === 0) {
+      getRegions().then(setRegions).catch(() => {});
+    }
+  }, [data.total, regions.length]);
+
+  // Gdy baza jest pusta, a pobieranie trwa w tle — odpytuj serwer co 15 s,
+  // żeby strona sama pokazała wyniki po zakończeniu bootstrapu.
+  useEffect(() => {
+    if (loading) return;
+    if (data.total === 0 && stats?.last_run?.status === "running") {
+      const t = setTimeout(() => setTick((x) => x + 1), 15000);
+      return () => clearTimeout(t);
+    }
+  }, [loading, data.total, stats]);
+
   // Lista ogłoszeń — przy każdej zmianie filtrów lub strony.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError("");
+    setSlowHint(false);
+    const slowTimer = setTimeout(() => setSlowHint(true), 4000);
     getTenders({ ...filters, page })
-      .then((d) => !cancelled && setData(d))
+      .then((d) => {
+        if (cancelled) return;
+        setData(d);
+        getStats().then((s) => !cancelled && setStats(s)).catch(() => {});
+      })
       .catch(() => {
         if (!cancelled)
           setError("Nie udało się pobrać danych. Sprawdź, czy backend działa, i odśwież stronę.");
       })
-      .finally(() => !cancelled && setLoading(false));
+      .finally(() => {
+        clearTimeout(slowTimer);
+        if (!cancelled) {
+          setLoading(false);
+          setSlowHint(false);
+        }
+      });
     return () => {
       cancelled = true;
+      clearTimeout(slowTimer);
     };
-  }, [filters, page]);
+  }, [filters, page, tick]);
 
   const updateFilters = (patch) => {
     setFilters((f) => ({ ...f, ...patch }));
@@ -87,12 +121,21 @@ export default function App() {
           <span className="results-bar__count">
             {loading ? "Ładowanie…" : `Wyników: ${data.total}`}
           </span>
+          {loading && slowHint && (
+            <span className="results-bar__hint">
+              darmowy serwer budzi się ze snu — pierwsze wejście może potrwać do minuty
+            </span>
+          )}
         </div>
 
         {error && <div className="alert">{error}</div>}
 
         {!loading && !error && data.items.length === 0 && (
-          <EmptyState databaseEmpty={(stats?.total ?? 0) === 0} onReset={resetFilters} />
+          <EmptyState
+            databaseEmpty={(stats?.total ?? 0) === 0}
+            lastRun={stats?.last_run}
+            onReset={resetFilters}
+          />
         )}
 
         <section className="cards" aria-busy={loading}>

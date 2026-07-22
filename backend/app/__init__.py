@@ -1,1 +1,0 @@
-"""PPOŻ Monitor — backend."""

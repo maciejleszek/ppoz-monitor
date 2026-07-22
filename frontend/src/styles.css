@@ -283,6 +283,16 @@ button {
   font-size: 0.78rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+}
+
+.results-bar__hint {
+  color: var(--amber);
+  text-transform: none;
+  letter-spacing: normal;
+  font-family: var(--font-body);
 }
 
 .alert {
@@ -732,4 +742,18 @@ button {
   .btn {
     transition: none;
   }
+}
+
+.empty__error {
+  color: var(--signal-dark);
+  background: #fdeceb;
+  border: 1px solid #f3b9b7;
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  font-size: 0.78rem;
+  word-break: break-word;
+  max-width: 640px;
+  margin-left: auto;
+  margin-right: auto;
+  text-align: left;
 }

@@ -49,6 +49,7 @@ class LastRun(BaseModel):
     found: int = 0
     added: int = 0
     updated: int = 0
+    message: Optional[str] = None
 
 
 class StatsOut(BaseModel):

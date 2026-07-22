@@ -11,6 +11,10 @@ services:
   # ── Backend: FastAPI + scraper + harmonogram ─────────────────────────────
   - type: web
     name: ppoz-monitor-api
+    # Przy ŚWIEŻYM wdrożeniu odkomentuj poniższą linię (region bliżej Polski;
+    # pomaga też, gdyby API BZP ograniczało ruch spoza Europy).
+    # Regionu istniejącej usługi nie da się zmienić — trzeba ją utworzyć od nowa.
+    # region: frankfurt
     runtime: python
     plan: free
     rootDir: backend
