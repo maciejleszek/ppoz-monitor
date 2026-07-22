@@ -1,0 +1,50 @@
+# Blueprint render.com — wdrożenie jednym kliknięciem (New + > Blueprint)
+# Tworzy: bazę PostgreSQL, backend (FastAPI) i frontend (React, statyczny).
+
+databases:
+  - name: ppoz-monitor-db
+    plan: free # UWAGA: darmowa baza na Render wygasa po 30 dniach (szczegóły w README)
+    databaseName: ppoz_monitor
+    user: ppoz_monitor
+
+services:
+  # ── Backend: FastAPI + scraper + harmonogram ─────────────────────────────
+  - type: web
+    name: ppoz-monitor-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.4
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ppoz-monitor-db
+          property: connectionString
+      - key: SCRAPE_TOKEN
+        generateValue: true # token do ręcznego wywołania POST /api/scrape
+      - key: ENABLE_SCHEDULER
+        value: "true"
+      - key: AUTO_BOOTSTRAP
+        value: "true" # przy pustej bazie pobierz dane z ostatnich 14 dni
+      - key: ENABLE_TED
+        value: "false" # eksperymentalne źródło TED (przetargi UE)
+      - key: CORS_ORIGINS
+        value: "*" # po wdrożeniu warto zawęzić do adresu frontendu
+
+  # ── Frontend: React (Vite) jako strona statyczna ─────────────────────────
+  - type: web
+    name: ppoz-monitor
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        fromService:
+          name: ppoz-monitor-api
+          type: web
+          property: host # sam hostname; frontend dokleja https://
